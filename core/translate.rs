@@ -3,17 +3,19 @@ use std::rc::Rc;
 
 use crate::function::AggFunc;
 use crate::pager::Pager;
-use crate::schema::{Schema, Table};
+use crate::schema::{BTreeTable, Schema, Table};
+use crate::sorter;
 use crate::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
 use crate::util::normalize_ident;
 use crate::vdbe::{Insn, Program, ProgramBuilder};
 use anyhow::Result;
-use sqlite3_parser::ast;
+use sqlite3_parser::ast::{self, SortedColumn};
 
-struct Select<'a> {
+struct Select {
     columns: Vec<ast::ResultColumn>,
     column_info: Vec<ColumnInfo>,
-    from: Option<&'a Table>,
+    from: Option<Table>,
+    order_by: Option<Vec<SortedColumn>>,
     limit: Option<ast::Limit>,
     exist_aggregation: bool,
 }
@@ -74,12 +76,13 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
                 Some(table) => table,
                 None => anyhow::bail!("Parse error: no such table: {}", table_name),
             };
-            let column_info = analyze_columns(&columns, Some(&table));
+            let column_info = analyze_columns(&columns, Some(table.clone()));
             let exist_aggregation = column_info.iter().any(|info| info.func.is_some());
             Ok(Select {
                 columns,
                 column_info,
-                from: Some(&table),
+                from: Some(Table::BTree(table)),
+                order_by: select.order_by.clone(),
                 limit: select.limit.clone(),
                 exist_aggregation,
             })
@@ -95,6 +98,7 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
                 columns,
                 column_info,
                 from: None,
+                order_by: select.order_by.clone(),
                 limit: select.limit.clone(),
                 exist_aggregation,
             })
@@ -114,7 +118,7 @@ fn translate_select(select: Select) -> Result<Program> {
         Some(translate_expr(
             &mut program,
             None,
-            None,
+            &None,
             &limit.expr,
             target_register,
         ))
@@ -123,7 +127,21 @@ fn translate_select(select: Select) -> Result<Program> {
     };
     let cursor_id = program.alloc_cursor_id();
     let limit_decr_insn = match select.from {
-        Some(table) => {
+        Some(ref table) => {
+            let sorter_cursor = match select.order_by {
+                Some(ref order_by) => {
+                    let sorter_cursor = program.alloc_cursor_id();
+                    program.emit_insn(Insn::SorterOpen {
+                        cursor_id: sorter_cursor,
+                    });
+                    Some((sorter_cursor, order_by))
+                }
+                None => None,
+            };
+            let table = match table {
+                Table::BTree(table) => table,
+                Table::Pseudo(_) => unreachable!(),
+            };
             let root_page = table.root_page;
             program.emit_insn(Insn::OpenReadAsync {
                 cursor_id,
@@ -132,6 +150,22 @@ fn translate_select(select: Select) -> Result<Program> {
             program.emit_insn(Insn::OpenReadAwait);
             program.emit_insn(Insn::RewindAsync { cursor_id });
             let rewind_await_offset = program.emit_placeholder();
+            if let Some((sorter_cursor_id, order_by)) = sorter_cursor {
+                for col in order_by {
+                    let col_name = match &col.expr {
+                        ast::Expr::Id(ident) => &ident.0,
+                        _ => todo!(),
+                    };
+                    let col = table.get_column(col_name).unwrap();
+                    let col_idx = col.0;
+                    let dest_reg = program.alloc_register();
+                    program.emit_insn(Insn::Column {
+                        column: col_idx,
+                        dest: dest_reg,
+                        cursor_id,
+                    });
+                }
+            };
             let (register_start, register_end) =
                 translate_columns(&mut program, Some(cursor_id), &select);
             let limit_decr_insn = if select.exist_aggregation {
@@ -157,18 +191,62 @@ fn translate_select(select: Select) -> Result<Program> {
                 });
                 limit_reg.map(|_| program.emit_placeholder())
             } else {
-                program.emit_insn(Insn::ResultRow {
-                    start_reg: register_start,
-                    count: register_end - register_start,
-                });
+                if let Some((sorter_cursor, _)) = sorter_cursor {
+                    let record_reg = program.alloc_register();
+                    // FIXME: we need to translate some extra columns that are the key
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                        dest_reg: record_reg,
+                    });
+                    program.emit_insn(Insn::SorterInsert {
+                        cursor_id: sorter_cursor,
+                        record_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::ResultRow {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                    });
+                }
                 let limit_decr_insn = limit_reg.map(|_| program.emit_placeholder());
                 program.emit_insn(Insn::NextAsync { cursor_id });
                 program.emit_insn(Insn::NextAwait {
                     cursor_id,
                     pc_if_next: rewind_await_offset,
                 });
+                if let Some((sorter_cursor_id, _)) = sorter_cursor {
+                    let pseudo_cursor_id = program.alloc_cursor_id();
+                    let pseudo_content_reg = program.alloc_register();
+                    let num_fields = 1; // FIXME
+                    program.emit_insn(Insn::OpenPseudo {
+                        cursor_id: pseudo_cursor_id,
+                        content_reg: pseudo_content_reg,
+                        num_fields,
+                    });
+                    program.emit_insn(Insn::SorterSort {
+                        cursor_id: sorter_cursor_id,
+                    });
+                    let sorter_data_offset = program.offset();
+                    program.emit_insn(Insn::SorterData {
+                        cursor_id: sorter_cursor_id,
+                        dest_reg: pseudo_content_reg,
+                    });
+                    // FIXME: translate columns from pseudo table
+                    let (register_start, register_end) =
+                        translate_columns(&mut program, Some(cursor_id), &select);
+                    program.emit_insn(Insn::ResultRow {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                    });
+                    program.emit_insn(Insn::SorterNext {
+                        cursor_id: sorter_cursor_id,
+                        pc_if_next: sorter_data_offset,
+                    });
+                }
                 limit_decr_insn
             };
+
             program.fixup_insn(
                 rewind_await_offset,
                 Insn::RewindAwait {
@@ -229,7 +307,7 @@ fn translate_columns(
 
     let mut target = register_start;
     for (col, info) in select.columns.iter().zip(select.column_info.iter()) {
-        translate_column(program, cursor_id, select.from, col, info, target);
+        translate_column(program, cursor_id, &select.from, col, info, target);
         target += info.columns_to_allocate;
     }
     (register_start, register_end)
@@ -238,7 +316,7 @@ fn translate_columns(
 fn translate_column(
     program: &mut ProgramBuilder,
     cursor_id: Option<usize>,
-    table: Option<&crate::schema::Table>,
+    table: &Option<Table>,
     col: &sqlite3_parser::ast::ResultColumn,
     info: &ColumnInfo,
     target_register: usize, // where to store the result, in case of star it will be the start of registers added
@@ -253,7 +331,7 @@ fn translate_column(
             }
         }
         sqlite3_parser::ast::ResultColumn::Star => {
-            for (i, col) in table.unwrap().columns.iter().enumerate() {
+            for (i, col) in table.as_ref().unwrap().columns().iter().enumerate() {
                 if col.is_rowid_alias() {
                     program.emit_insn(Insn::RowId {
                         cursor_id: cursor_id.unwrap(),
@@ -274,14 +352,14 @@ fn translate_column(
 
 fn analyze_columns(
     columns: &Vec<sqlite3_parser::ast::ResultColumn>,
-    table: Option<&crate::schema::Table>,
+    table: Option<Rc<BTreeTable>>,
 ) -> Vec<ColumnInfo> {
     let mut column_information_list = Vec::with_capacity(columns.len());
     for column in columns {
         let mut info = ColumnInfo::new();
         info.columns_to_allocate = 1;
         if let sqlite3_parser::ast::ResultColumn::Star = column {
-            info.columns_to_allocate = table.unwrap().columns.len();
+            info.columns_to_allocate = table.as_ref().unwrap().columns.len();
         } else {
             analyze_column(column, &mut info);
         }
@@ -333,7 +411,7 @@ fn analyze_column(column: &sqlite3_parser::ast::ResultColumn, column_info_out: &
 fn translate_expr(
     program: &mut ProgramBuilder,
     cursor_id: Option<usize>,
-    table: Option<&crate::schema::Table>,
+    table: &Option<Table>,
     expr: &ast::Expr,
     target_register: usize,
 ) -> usize {
@@ -348,7 +426,7 @@ fn translate_expr(
         ast::Expr::FunctionCall { .. } => todo!(),
         ast::Expr::FunctionCallStar { .. } => todo!(),
         ast::Expr::Id(ident) => {
-            let (idx, col) = table.unwrap().get_column(&ident.0).unwrap();
+            let (idx, col) = table.as_ref().unwrap().get_column(&ident.0).unwrap();
             if col.primary_key {
                 program.emit_insn(Insn::RowId {
                     cursor_id: cursor_id.unwrap(),
@@ -413,7 +491,7 @@ fn translate_expr(
 fn translate_aggregation(
     program: &mut ProgramBuilder,
     cursor_id: Option<usize>,
-    table: Option<&crate::schema::Table>,
+    table: &Option<Table>,
     expr: &ast::Expr,
     info: &ColumnInfo,
     target_register: usize,
